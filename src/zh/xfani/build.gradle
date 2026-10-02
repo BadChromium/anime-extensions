@@ -1,7 +1,19 @@
 ext {
     extName = 'Xfani'
     extClass = '.Xfani'
-    extVersionCode = 8
+    extVersionCode = 9
 }
 
 apply plugin: "kei.plugins.extension.legacy"
+
+android {
+    sourceSets.test.java.srcDirs = ['tests']
+    sourceSets.test.kotlin.srcDirs = ['tests']
+    sourceSets.test.resources.srcDirs = ['tests/resources']
+    testOptions.unitTests.returnDefaultValues = true
+}
+
+dependencies {
+    testImplementation libs.bundles.common
+    testImplementation libs.junit
+}

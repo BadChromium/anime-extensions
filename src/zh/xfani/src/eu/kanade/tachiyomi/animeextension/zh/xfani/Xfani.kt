@@ -1,13 +1,8 @@
 package eu.kanade.tachiyomi.animeextension.zh.xfani
 
-import android.annotation.SuppressLint
-import android.content.SharedPreferences
-import android.widget.Toast
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
-import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
-import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.SAnime
@@ -15,361 +10,167 @@ import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
-import eu.kanade.tachiyomi.network.awaitSuccess
 import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.utils.AnimeHttpLegacySource
 import keiyoushi.utils.getPreferencesLazy
-import kotlinx.coroutines.CoroutineExceptionHandler
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
-import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.Interceptor
-import okhttp3.MultipartBody
-import okhttp3.OkHttpClient
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
-import org.jsoup.nodes.Document
-import org.jsoup.select.Elements
-import uy.kohesive.injekt.injectLazy
-import java.security.SecureRandom
-import java.security.cert.X509Certificate
-import javax.net.ssl.SSLContext
-import javax.net.ssl.SSLHandshakeException
-import javax.net.ssl.TrustManager
-import javax.net.ssl.X509TrustManager
-
-enum class FilterUpdateState {
-    NONE,
-    UPDATING,
-    UPDATED,
-    FAILED,
-}
 
 class Xfani :
     AnimeHttpLegacySource(),
     ConfigurableAnimeSource {
-    override val baseUrl: String
-        get() = "https://anime.xifanacg.com"
-    override val lang: String
-        get() = "zh"
-    override val name: String
-        get() = "稀饭动漫"
-    override val supportsLatest: Boolean
-        get() = true
+    override val baseUrl = "https://next.xifanacg.com"
+    override val lang = "zh"
+    override val name = "稀饭动漫"
+    override val supportsLatest = true
 
-    private val json by injectLazy<Json>()
     private val preferences by getPreferencesLazy()
-    private val numberRegex = Regex("\\d+")
-    private var filterState = FilterUpdateState.NONE
+    private val selectedSourceCode
+        get() = SOURCE_CODES.getOrElse(preferences.getString(PREF_KEY_VIDEO_SOURCE, "0")?.toIntOrNull() ?: 0) { SOURCE_CODES[0] }
 
-    private fun OkHttpClient.Builder.ignoreAllSSLErrors(): OkHttpClient.Builder {
-        val naiveTrustManager =
-            @SuppressLint("CustomX509TrustManager")
-            object : X509TrustManager {
-                override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
-                override fun checkClientTrusted(certs: Array<X509Certificate>, authType: String) = Unit
+    private val apiHeaders
+        get() = headers.newBuilder()
+            .set("apikey", API_KEY)
+            .set("Origin", baseUrl)
+            .set("Referer", "$baseUrl/")
+            .build()
 
-                override fun checkServerTrusted(certs: Array<X509Certificate>, authType: String) = Unit
+    private fun apiRequest(path: String, body: String): Request = POST(
+        "$API_URL/$path",
+        apiHeaders,
+        body.toRequestBody("application/json; charset=utf-8".toMediaType()),
+    )
+
+    override fun popularAnimeRequest(page: Int): Request = searchAnimeRequest(page, "", AnimeFilterList(SortFilter().apply { state = 1 }))
+    override fun popularAnimeParse(response: Response): AnimesPage = searchAnimeParse(response)
+    override fun latestUpdatesRequest(page: Int): Request = GET("$baseUrl/recent?page=$page", headers)
+    override fun latestUpdatesParse(response: Response): AnimesPage {
+        val page = response.request.url.queryParameter("page")?.toIntOrNull() ?: 1
+        val items = XfaniParser.recent(response.asJsoup())
+        return AnimesPage(XfaniParser.recentPage(items, page, PAGE_SIZE).map { it.toAnime() }, page.toLong() * PAGE_SIZE < items.size)
+    }
+
+    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
+        val body = buildJsonObject {
+            put("search_term", query)
+            put("page_number", page)
+            put("items_per_page", PAGE_SIZE)
+            put("sort_by", filters.filterIsInstance<SortFilter>().firstOrNull()?.selected ?: "release_date")
+            put("sort_order", "desc")
+            filters.forEach { filter ->
+                when (filter) {
+                    is TypeFilter -> filter.selected.toIntOrNull()?.let { put("filter_type_id", it) }
+                    is ClassFilter -> if (filter.selected.isNotEmpty()) put("filter_meta_tags", JsonArray(listOf(JsonPrimitive(filter.selected))))
+                    is VersionFilter -> if (filter.selected.isNotEmpty()) put("filter_format", filter.selected)
+                    is YearFilter -> filter.selected.toIntOrNull()?.let { put("filter_release_year", it) }
+                    else -> Unit
+                }
             }
-
-        val insecureSocketFactory = SSLContext.getInstance("TLSv1.2").apply {
-            val trustAllCerts = arrayOf<TrustManager>(naiveTrustManager)
-            init(null, trustAllCerts, SecureRandom())
-        }.socketFactory
-
-        sslSocketFactory(insecureSocketFactory, naiveTrustManager)
-        hostnameVerifier { _, _ -> true }
-        return this
-    }
-
-    override val client: OkHttpClient by lazy {
-        if (preferences.getBoolean(PREF_KEY_IGNORE_SSL_ERROR, false)) {
-            network.client.newBuilder().ignoreAllSSLErrors()
-        } else {
-            network.client.newBuilder().addInterceptor(::checkSSLErrorInterceptor)
-        }.addInterceptor(::updateFiltersInterceptor).build()
-    }
-
-    private val selectedVideoSource
-        get() = preferences.getString(PREF_KEY_VIDEO_SOURCE, DEFAULT_VIDEO_SOURCE)!!.toInt()
-
-    private fun checkSSLErrorInterceptor(chain: Interceptor.Chain): Response {
-        try {
-            return chain.proceed(chain.request())
-        } catch (e: SSLHandshakeException) {
-            throw SSLHandshakeException("SSL证书验证异常，可以尝试在设置中忽略SSL验证问题。")
         }
+        return apiRequest("rest/v1/rpc/search_animes", body.toString())
     }
 
-    private fun updateFiltersInterceptor(chain: Interceptor.Chain): Response {
-        if (filterState == FilterUpdateState.NONE) {
-            updateFilter()
-        }
-        return chain.proceed(chain.request())
+    override fun searchAnimeParse(response: Response): AnimesPage {
+        val items = XfaniParser.catalogue(response.body.string())
+        // The POST response does not carry the request's page number.
+        val requestBody = okio.Buffer().also { response.request.body!!.writeTo(it) }.readUtf8()
+        return AnimesPage(items.map { it.toAnime() }, XfaniParser.hasNextPage(items, requestBody, PAGE_SIZE))
     }
 
-    override fun animeDetailsParse(response: Response): SAnime {
-        val doc = response.asJsoup()
-        return SAnime.create().apply {
-            description = doc.select("#height_limit.text").text()
-            title = doc.select(".slide-info-title").text()
-            author = doc.select(".slide-info:contains(导演 :)").text().removePrefix("导演 :")
-                .removeSuffix(",")
-            artist = doc.select(".slide-info:contains(演员 :)").text().removePrefix("演员 :")
-                .removeSuffix(",")
-            genre = doc.select(".slide-info:contains(类型 :)").text().removePrefix("类型 :")
-                .removeSuffix(",").replace(",", ", ")
-        }
+    private fun AnimeInfo.toAnime(): SAnime = SAnime.create().apply {
+        url = "/anime/$id"
+        title = this@toAnime.title
+        thumbnail_url = coverUrl
+        description = this@toAnime.description
+        author = director
+        artist = actors?.joinToString(", ")
+        genre = metaTags?.joinToString(", ")
+        status = if (isFinished) SAnime.COMPLETED else SAnime.ONGOING
     }
+
+    private fun animePath(anime: SAnime): String {
+        require(Regex("^/anime/\\d+$").matches(anime.url)) { "旧番剧链接已失效，请在新站重新搜索番剧。" }
+        return anime.url
+    }
+
+    override fun animeDetailsRequest(anime: SAnime): Request = GET(baseUrl + animePath(anime), headers)
+    override fun episodeListRequest(anime: SAnime): Request = animeDetailsRequest(anime)
+    override fun animeDetailsParse(response: Response): SAnime = XfaniParser.detail(response.asJsoup()).anime.toAnime()
 
     override fun episodeListParse(response: Response): List<SEpisode> {
-        val jsoup = response.asJsoup()
-        val result = jsoup.select("ul.anthology-list-play.size")
-        val episodeList = if (result.size > selectedVideoSource) {
-            result[selectedVideoSource]
-        } else {
-            result[0]
-        }.select("li > a")
-        return episodeList.map {
+        val detail = XfaniParser.detail(response.asJsoup())
+        return XfaniParser.episodes(detail.sources, selectedSourceCode).map { episode ->
             SEpisode.create().apply {
-                name = it.text()
-                url = it.attr("href")
+                url = XfaniParser.episodePath(detail.anime.id, episode, detail.sources, selectedSourceCode)
+                name = XfaniParser.episodeName(episode)
+                episode_number = episode.number
             }
         }.reversed()
     }
 
+    override fun videoListRequest(episode: SEpisode): Request {
+        require(Regex("^/anime/\\d+/play/\\d+(?:\\?.*)?$").matches(episode.url)) { "旧播放链接已失效，请刷新番剧的剧集列表后重试。" }
+        return GET(baseUrl + episode.url, headers)
+    }
+
+    private fun resolvePlayback(episodeId: Int, sourceId: Int): PlaybackCandidate {
+        val body = buildJsonObject {
+            put("action", "fallback")
+            put("episode_id", episodeId)
+            put("source_id", sourceId)
+        }
+        client.newCall(apiRequest("functions/v1/issue-web-playback", body.toString())).execute().use { response ->
+            check(response.isSuccessful) { "播放解析失败：HTTP ${response.code}，请稍后重试或切换线路。" }
+            return XfaniParser.playback(response.body.string(), sourceId)
+        }
+    }
+
     override fun videoListParse(response: Response): List<Video> {
-        val requestUrl = response.request.url
-        val currentPath = requestUrl.encodedPath
-        val currentEpisodePathName = response.request.url.pathSegments.last()
-        val document = response.asJsoup()
-        val videoUrl = findVideoUrl(document)
-        val allEpisodeElements =
-            document.select(".player-anthology .anthology-list .anthology-list-box")
-                .map { element ->
-                    element.select(".anthology-list-play li a")
-                }
-        val currentEpisodeName = allEpisodeElements.firstNotNullOfOrNull { elements ->
-            elements.firstOrNull { it.attr("href") == currentPath }?.select("span")?.text()
-        }
-        val targetEpisodeNumber =
-            currentEpisodeName?.let { numberRegex.find(it)?.value?.toIntOrNull() } ?: -1
-        val sourceList = allEpisodeElements.map { elements ->
-            elements.findSourceOrNull { name, _ -> name == currentEpisodeName }
-                ?: elements.findSourceOrNull { name, _ -> numberRegex.find(name)?.value?.toIntOrNull() == targetEpisodeNumber }
-                ?: elements.findSourceOrNull { _, url -> url.endsWith(currentEpisodePathName) }
-        }
-        val sourceNameList = document.select(".anthology-tab .swiper-wrapper a").map {
-            it.ownText().trim()
-        }
-        return sourceList.zip(sourceNameList) { source, name ->
-            if (source == null) {
-                Video(url = "", quality = "", videoUrl = null)
-            } else if (source.second.endsWith(currentPath)) {
-                Video("$baseUrl${source.second}", "$name-${source.first}", videoUrl = videoUrl)
-            } else {
-                Video("$baseUrl${source.second}", "$name-${source.first}", videoUrl = null)
-            }
-        }.filter { it.videoTitle.isNotEmpty() }.sortedByDescending { it.videoUrl.isNotEmpty() }
-    }
-
-    private fun Elements.findSourceOrNull(predicate: (name: String, url: String) -> Boolean): Pair<String, String>? = firstNotNullOfOrNull {
-        val name = it.selectFirst("span")?.text() ?: ""
-        val url = it.attr("href")
-        if (predicate(name, url)) {
-            name to url
-        } else {
-            null
+        val play = XfaniParser.playPage(response.asJsoup())
+        val sources = play.sources.filter { source -> source.episodes.any { it.id == play.episodeId } }
+        check(sources.isNotEmpty()) { "暂无可用播放线路。" }
+        // Resolve only when selected by the user; one unavailable line must not hide the others.
+        return sources.sortedByDescending { it.code == play.pageSourceCode }.map { source ->
+            Video("$baseUrl/anime/${play.animeId}/play/${play.episodeId}?source=${source.code}", source.name, videoUrl = null, headers = headers)
         }
     }
 
-    override fun videoUrlParse(response: Response): String = findVideoUrl(response.asJsoup())
-
-    private fun findVideoUrl(document: Document): String {
-        val script = document.select("script:containsData(player_aaaa)").first()!!.data()
-        val info = script.substringAfter("player_aaaa=").let { json.parseToJsonElement(it) }
-        return info.jsonObject["url"]!!.jsonPrimitive.content
+    override fun videoUrlParse(response: Response): String {
+        val play = XfaniParser.playPage(response.asJsoup())
+        val code = response.request.url.queryParameter("source") ?: play.pageSourceCode
+        val source = play.sources.firstOrNull { it.code == code && it.episodes.any { episode -> episode.id == play.episodeId } }
+            ?: error("当前线路没有这一集，请切换线路。")
+        return resolvePlayback(play.episodeId, source.id).url
     }
 
-    override fun latestUpdatesParse(response: Response): AnimesPage = vodListToAnimePageList(response)
+    override fun getFilterList(): AnimeFilterList = AnimeFilterList(TypeFilter(), ClassFilter(), VersionFilter(), YearFilter(), SortFilter())
 
-    override fun latestUpdatesRequest(page: Int): Request = searchAnimeRequest(page, "", AnimeFilterList())
-
-    override fun popularAnimeParse(response: Response): AnimesPage = vodListToAnimePageList(response)
-
-    override fun popularAnimeRequest(page: Int): Request = searchAnimeRequest(page, "", AnimeFilterList(SortFilter().apply { state = 1 }))
-
-    private fun vodListToAnimePageList(response: Response): AnimesPage {
-        val responseBody = response.body.string()
-        if (response.request.url.encodedPath.endsWith("suggest")) {
-            val suggestResponse = json.decodeFromString<SuggestResponse>(responseBody)
-            val animeList = suggestResponse.list.map {
-                SAnime.create().apply {
-                    url = "/bangumi/${it.id}.html"
-                    thumbnail_url = it.pic
-                    title = it.name
-                }
-            }
-            return AnimesPage(
-                animeList,
-                suggestResponse.page < suggestResponse.pageCount,
-            )
-        }
-
-        val vodResponse = json.decodeFromString<VodResponse>(responseBody)
-        val animeList = vodResponse.list.map {
-            SAnime.create().apply {
-                url = "/bangumi/${it.vodId}.html"
-                thumbnail_url = it.vodPicThumb.ifEmpty { it.vodPic }
-                title = it.vodName
-                author = it.vodActor.replace(",,,", "")
-                description = it.vodBlurb
-                genre = it.vodClass.replace(",", ", ")
-            }
-        }
-        return AnimesPage(
-            animeList,
-            animeList.isNotEmpty() && vodResponse.page * vodResponse.limit < vodResponse.total,
+    override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        screen.addPreference(
+            ListPreference(screen.context).apply {
+                key = PREF_KEY_VIDEO_SOURCE
+                title = "请设置首选视频源线路"
+                entries = arrayOf("主线-1", "主线-2", "备用-1")
+                entryValues = arrayOf("0", "1", "2")
+                setDefaultValue("0")
+                summary = "%s"
+            },
         )
     }
 
-    override fun searchAnimeParse(response: Response): AnimesPage = vodListToAnimePageList(response)
-
-    private val scope by lazy { CoroutineScope(SupervisorJob() + Dispatchers.IO) }
-
-    private fun updateFilter() {
-        filterState = FilterUpdateState.UPDATING
-        val handler = CoroutineExceptionHandler { _, _ ->
-            filterState = FilterUpdateState.FAILED
-        }
-        scope.launch(handler) {
-            val jsoup = client.newCall(GET("$baseUrl/show/1/html")).awaitSuccess().asJsoup()
-            // update class and year filter type
-            val classList = jsoup.select("li[data-type=class]").eachAttr("data-val")
-            val yearList = jsoup.select("li[data-type=year]").eachAttr("data-val")
-            preferences.edit()
-                .putString(PREF_KEY_FILTER_CLASS, classList.joinToString())
-                .putString(PREF_KEY_FILTER_YEAR, yearList.joinToString())
-                .apply()
-            filterState = FilterUpdateState.UPDATED
-        }
-    }
-
-    private fun SharedPreferences.createTagFilter(
-        key: String,
-        block: (tags: Array<String>) -> TagFilter?,
-    ): TagFilter? {
-        val savedTags = getString(key, "")!!
-        if (savedTags.isBlank()) {
-            return block(emptyArray())
-        }
-        val tags = savedTags.split(", ").toMutableList()
-        if (tags[0].isBlank()) {
-            tags[0] = "全部"
-        }
-        return block(tags.toTypedArray())
-    }
-
-    override fun getFilterList(): AnimeFilterList = AnimeFilterList(
-        listOfNotNull(
-            AnimeFilter.Header("以下筛选对搜索结果无效"),
-            TypeFilter(),
-            preferences.createTagFilter(PREF_KEY_FILTER_CLASS) {
-                if (it.isEmpty()) {
-                    ClassFilter()
-                } else {
-                    ClassFilter(it)
-                }
-            },
-            preferences.createTagFilter(PREF_KEY_FILTER_YEAR) {
-                if (it.isEmpty()) {
-                    null
-                } else {
-                    YearFilter(it)
-                }
-            },
-            VersionFilter(),
-            LetterFilter(),
-            SortFilter(),
-        ),
-    )
-
-    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
-        if (query.isNotBlank()) {
-            val url = "$baseUrl/index.php/ajax/suggest".toHttpUrl().newBuilder()
-                .addQueryParameter("mid", "1")
-                .addQueryParameter("wd", query)
-                .addQueryParameter("page", "$page")
-                .addQueryParameter("limit", "40")
-                .build()
-            return GET(url.toString(), headers)
-        }
-
-        val url = baseUrl.toHttpUrl().newBuilder().addPathSegments("index.php/api/vod").build()
-        val time = System.currentTimeMillis() / 1000
-        val formBody =
-            MultipartBody.Builder().setType(MultipartBody.FORM).addFormDataPart("page", "$page")
-                .addFormDataPart("time", "$time").addFormDataPart("key", generateKey(time))
-
-        filters.forEach { filter ->
-            when (filter) {
-                is TypeFilter -> formBody.addFormDataPart("type", filter.selected)
-                is ClassFilter -> formBody.addFormDataPart("class", filter.selected)
-                is YearFilter -> formBody.addFormDataPart("year", filter.selected)
-                is VersionFilter -> formBody.addFormDataPart("version", filter.selected)
-                is LetterFilter -> formBody.addFormDataPart("letter", filter.selected)
-                is SortFilter -> formBody.addFormDataPart("by", filter.selected)
-                else -> {}
-            }
-        }
-        if (filters.filterIsInstance<TypeFilter>().isEmpty()) {
-            formBody.addFormDataPart("type", "1")
-        }
-        return POST(url.toString(), body = formBody.build())
-    }
-
-    override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        screen.apply {
-            addPreference(
-                ListPreference(screen.context).apply {
-                    key = PREF_KEY_VIDEO_SOURCE
-                    title = "请设置首选视频源线路"
-                    entries = arrayOf("主线-1", "主线-2", "备用-1")
-                    entryValues = arrayOf("0", "1", "2")
-                    setDefaultValue(DEFAULT_VIDEO_SOURCE)
-                    summary = "当前选择：${entries[selectedVideoSource]}"
-                    setOnPreferenceChangeListener { _, newValue ->
-                        summary = "当前选择：${entries[(newValue as String).toInt()]}"
-                        true
-                    }
-                },
-            )
-            addPreference(
-                SwitchPreferenceCompat(screen.context).apply {
-                    key = PREF_KEY_IGNORE_SSL_ERROR
-                    title = "忽略SSL证书校验"
-                    setDefaultValue(false)
-                    setOnPreferenceChangeListener { _, _ ->
-                        Toast.makeText(screen.context, "重启应用后生效", Toast.LENGTH_SHORT).show()
-                        true
-                    }
-                },
-            )
-        }
-    }
-
     companion object {
-        const val PREF_KEY_VIDEO_SOURCE = "PREF_KEY_VIDEO_SOURCE"
-        const val PREF_KEY_IGNORE_SSL_ERROR = "PREF_KEY_IGNORE_SSL_ERROR"
+        private const val API_URL = "https://api.xifanacg.com"
 
-        const val PREF_KEY_FILTER_CLASS = "PREF_KEY_FILTER_CLASS"
-        const val PREF_KEY_FILTER_YEAR = "PREF_KEY_FILTER_YEAR"
-
-        const val DEFAULT_VIDEO_SOURCE = "0"
+        // Public browser publishable key from the site's Supabase client, not a user credential.
+        private const val API_KEY = "sb_publishable_OBIVAWACIX6lPXrO98_z24_HcsmalkA"
+        private const val PAGE_SIZE = 24
+        private const val PREF_KEY_VIDEO_SOURCE = "PREF_KEY_VIDEO_SOURCE"
+        private val SOURCE_CODES = listOf("xfxf1", "AL", "CS")
     }
 }

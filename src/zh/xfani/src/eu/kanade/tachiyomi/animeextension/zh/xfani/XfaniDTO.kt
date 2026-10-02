@@ -4,56 +4,76 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
 @Serializable
-data class VodInfo(
-    @SerialName("vod_id")
-    val vodId: Int,
-    @SerialName("vod_level")
-    val vodLevel: Int = 0,
-    @SerialName("vod_name")
-    val vodName: String,
-    @SerialName("vod_pic")
-    val vodPic: String,
-    @SerialName("vod_pic_thumb")
-    val vodPicThumb: String = "",
-    @SerialName("vod_tag")
-    val vodTag: String = "",
-    @SerialName("vod_class")
-    val vodClass: String,
-    @SerialName("vod_remarks")
-    val vodRemarks: String,
-    @SerialName("vod_serial")
-    val vodSerial: String,
-    @SerialName("vod_sub")
-    val vodSub: String,
-    @SerialName("vod_actor")
-    val vodActor: String,
-    @SerialName("vod_blurb")
-    val vodBlurb: String,
-)
-
-@Serializable
-data class VodResponse(
-    val page: Int,
-    @SerialName("pagecount")
-    val pageCount: Int,
-    val limit: Int,
-    val total: Int,
-    val list: List<VodInfo>,
-)
-
-@Serializable
-data class SuggestInfo(
+data class AnimeInfo(
     val id: Int,
-    val name: String,
-    val pic: String,
+    val title: String,
+    val aliases: List<String>? = null,
+    @SerialName("title_original") val titleOriginal: String? = null,
+    @SerialName("cover_url") val coverUrl: String? = null,
+    val description: String? = null,
+    val director: String? = null,
+    val actors: List<String>? = null,
+    @SerialName("meta_tags") val metaTags: List<String>? = null,
+    @SerialName("is_finished") val isFinished: Boolean = false,
+    @SerialName("total_count") val totalCount: Int = 0,
 )
 
 @Serializable
-data class SuggestResponse(
-    val page: Int,
-    @SerialName("pagecount")
-    val pageCount: Int,
-    val limit: Int,
-    val total: Int,
-    val list: List<SuggestInfo>,
+data class DetailInfo(
+    val anime: AnimeInfo,
+    val sources: List<SourceInfo>,
+)
+
+@Serializable
+data class RecentInfo(val windows: List<RecentWindow>)
+
+@Serializable
+data class RecentWindow(val days: Int, val items: List<RecentAnime>)
+
+@Serializable
+data class RecentAnime(
+    val id: Int,
+    val title: String,
+    val coverUrl: String? = null,
+    val isFinished: Boolean = false,
+)
+
+@Serializable
+data class PlayInfo(
+    val episodeId: Int,
+    val animeId: Int,
+    val sources: List<SourceInfo>,
+    val pageSourceCode: String,
+)
+
+@Serializable
+data class SourceInfo(
+    val id: Int,
+    val code: String,
+    val name: String,
+    val episodes: List<EpisodeInfo>,
+)
+
+@Serializable
+data class EpisodeInfo(
+    val id: Int,
+    val kind: String = "main",
+    val title: String? = null,
+    @SerialName("episode_number") val number: Float,
+)
+
+@Serializable
+data class PlaybackInfo(
+    val ok: Boolean,
+    val error: String? = null,
+    val url: String? = null,
+    val candidates: List<PlaybackCandidate> = emptyList(),
+)
+
+@Serializable
+data class PlaybackCandidate(
+    @SerialName("source_id") val sourceId: Int,
+    @SerialName("source_name") val sourceName: String,
+    val url: String,
+    val quality: String? = null,
 )
