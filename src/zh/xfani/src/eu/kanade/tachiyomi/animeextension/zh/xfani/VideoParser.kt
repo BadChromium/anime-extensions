@@ -1,16 +1,13 @@
 package eu.kanade.tachiyomi.animeextension.zh.xfani
 
+import eu.kanade.tachiyomi.animesource.model.Hoster
 import keiyoushi.utils.extractNextJs
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.int
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
+import keiyoushi.utils.parseAs
+import keiyoushi.utils.toJsonString
 import org.jsoup.nodes.Document
 
-object XfaniParser {
-    private val json = Json { ignoreUnknownKeys = true }
-
-    fun catalogue(body: String): List<AnimeInfo> = json.decodeFromString(body)
+object VideoParser {
+    fun catalogue(body: String): List<AnimeInfo> = body.parseAs()
 
     fun recent(document: Document): List<AnimeInfo> {
         val board = document.extractNextJs<RecentInfo>()
@@ -24,7 +21,7 @@ object XfaniParser {
     fun recentPage(items: List<AnimeInfo>, page: Int, pageSize: Int): List<AnimeInfo> = items.drop((page - 1) * pageSize).take(pageSize)
 
     fun hasNextPage(items: List<AnimeInfo>, requestBody: String, pageSize: Int): Boolean {
-        val page = json.parseToJsonElement(requestBody).jsonObject.getValue("page_number").jsonPrimitive.int
+        val page = requestBody.parseAs<CataloguePage>().pageNumber
         return items.isNotEmpty() && page.toLong() * pageSize < items.first().totalCount
     }
 
@@ -50,13 +47,25 @@ object XfaniParser {
     }
 
     fun episodeName(episode: EpisodeInfo): String {
-        val number = if (episode.number % 1f == 0f) episode.number.toInt().toString() else episode.number.toString()
+        val number = episode.number.toString().removeSuffix(".0")
         val label = if (episode.kind == "main") "第${number}集" else "${episode.kind.uppercase()} $number"
         return episode.title?.takeIf { it.isNotBlank() }?.let { "$label $it" } ?: label
     }
 
-    fun playback(body: String, sourceId: Int): PlaybackCandidate {
-        val playback = json.decodeFromString<PlaybackInfo>(body)
+    fun hosters(play: PlayInfo, baseUrl: String): List<Hoster> = play.sources
+        .filter { source -> source.episodes.any { it.id == play.episodeId } }
+        .sortedByDescending { it.code == play.pageSourceCode }
+        .map { source ->
+            Hoster(
+                hosterName = source.name,
+                hosterUrl = "$baseUrl/anime/${play.animeId}/play/${play.episodeId}?source=${source.code}",
+                internalData = PlaybackRequest("fallback", play.episodeId, source.id).toJsonString(),
+            )
+        }
+
+    fun playback(body: String, sourceId: Int): PlaybackCandidate = playback(body.parseAs<PlaybackInfo>(), sourceId)
+
+    fun playback(playback: PlaybackInfo, sourceId: Int): PlaybackCandidate {
         check(playback.ok) { "播放解析失败：${playback.error ?: "unknown"}，请切换线路或稍后重试。" }
         val candidate = playback.candidates.firstOrNull { it.sourceId == sourceId }
             ?: error("当前线路没有可用视频，请切换线路。")

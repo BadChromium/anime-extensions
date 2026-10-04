@@ -5,25 +5,24 @@ import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
+import eu.kanade.tachiyomi.animesource.model.Hoster
 import eu.kanade.tachiyomi.animesource.model.SAnime
 import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
+import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
+import eu.kanade.tachiyomi.network.awaitSuccess
 import eu.kanade.tachiyomi.util.asJsoup
-import keiyoushi.utils.AnimeHttpLegacySource
+import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.getPreferencesLazy
-import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.put
-import okhttp3.MediaType.Companion.toMediaType
+import keiyoushi.utils.parseAs
+import keiyoushi.utils.toJsonRequestBody
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 
 class Xfani :
-    AnimeHttpLegacySource(),
+    AnimeHttpSource(),
     ConfigurableAnimeSource {
     override val baseUrl = "https://next.xifanacg.com"
     override val lang = "zh"
@@ -41,10 +40,10 @@ class Xfani :
             .set("Referer", "$baseUrl/")
             .build()
 
-    private fun apiRequest(path: String, body: String): Request = POST(
+    private inline fun <reified T> apiRequest(path: String, body: T): Request = POST(
         "$API_URL/$path",
         apiHeaders,
-        body.toRequestBody("application/json; charset=utf-8".toMediaType()),
+        body.toJsonRequestBody(),
     )
 
     override fun popularAnimeRequest(page: Int): Request = searchAnimeRequest(page, "", AnimeFilterList(SortFilter().apply { state = 1 }))
@@ -52,101 +51,73 @@ class Xfani :
     override fun latestUpdatesRequest(page: Int): Request = GET("$baseUrl/recent?page=$page", headers)
     override fun latestUpdatesParse(response: Response): AnimesPage {
         val page = response.request.url.queryParameter("page")?.toIntOrNull() ?: 1
-        val items = XfaniParser.recent(response.asJsoup())
-        return AnimesPage(XfaniParser.recentPage(items, page, PAGE_SIZE).map { it.toAnime() }, page.toLong() * PAGE_SIZE < items.size)
+        val items = VideoParser.recent(response.asJsoup())
+        return AnimesPage(VideoParser.recentPage(items, page, PAGE_SIZE).map { it.toAnime() }, page.toLong() * PAGE_SIZE < items.size)
     }
 
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
-        val body = buildJsonObject {
-            put("search_term", query)
-            put("page_number", page)
-            put("items_per_page", PAGE_SIZE)
-            put("sort_by", filters.filterIsInstance<SortFilter>().firstOrNull()?.selected ?: "release_date")
-            put("sort_order", "desc")
-            filters.forEach { filter ->
-                when (filter) {
-                    is TypeFilter -> filter.selected.toIntOrNull()?.let { put("filter_type_id", it) }
-                    is ClassFilter -> if (filter.selected.isNotEmpty()) put("filter_meta_tags", JsonArray(listOf(JsonPrimitive(filter.selected))))
-                    is VersionFilter -> if (filter.selected.isNotEmpty()) put("filter_format", filter.selected)
-                    is YearFilter -> filter.selected.toIntOrNull()?.let { put("filter_release_year", it) }
-                    else -> Unit
-                }
-            }
-        }
-        return apiRequest("rest/v1/rpc/search_animes", body.toString())
+        val body = CatalogueRequest(
+            searchTerm = query,
+            pageNumber = page,
+            itemsPerPage = PAGE_SIZE,
+            sortBy = filters.firstInstanceOrNull<SortFilter>()?.selected ?: "release_date",
+            sortOrder = "desc",
+            typeId = filters.firstInstanceOrNull<TypeFilter>()?.selected?.toIntOrNull(),
+            metaTags = filters.firstInstanceOrNull<ClassFilter>()?.selected?.takeIf { it.isNotEmpty() }?.let { listOf(it) },
+            format = filters.firstInstanceOrNull<VersionFilter>()?.selected?.takeIf { it.isNotEmpty() },
+            releaseYear = filters.firstInstanceOrNull<YearFilter>()?.selected?.toIntOrNull(),
+        )
+        return apiRequest("rest/v1/rpc/search_animes", body)
     }
 
     override fun searchAnimeParse(response: Response): AnimesPage {
-        val items = XfaniParser.catalogue(response.body.string())
         // The POST response does not carry the request's page number.
         val requestBody = okio.Buffer().also { response.request.body!!.writeTo(it) }.readUtf8()
-        return AnimesPage(items.map { it.toAnime() }, XfaniParser.hasNextPage(items, requestBody, PAGE_SIZE))
-    }
-
-    private fun AnimeInfo.toAnime(): SAnime = SAnime.create().apply {
-        url = "/anime/$id"
-        title = this@toAnime.title
-        thumbnail_url = coverUrl
-        description = this@toAnime.description
-        author = director
-        artist = actors?.joinToString(", ")
-        genre = metaTags?.joinToString(", ")
-        status = if (isFinished) SAnime.COMPLETED else SAnime.ONGOING
+        val items = response.parseAs<List<AnimeInfo>>()
+        return AnimesPage(items.map { it.toAnime() }, VideoParser.hasNextPage(items, requestBody, PAGE_SIZE))
     }
 
     private fun animePath(anime: SAnime): String {
-        require(Regex("^/anime/\\d+$").matches(anime.url)) { "旧番剧链接已失效，请在新站重新搜索番剧。" }
+        require(ANIME_PATH.matches(anime.url)) { "旧番剧链接已失效，请在新站重新搜索番剧。" }
         return anime.url
     }
 
     override fun animeDetailsRequest(anime: SAnime): Request = GET(baseUrl + animePath(anime), headers)
     override fun episodeListRequest(anime: SAnime): Request = animeDetailsRequest(anime)
-    override fun animeDetailsParse(response: Response): SAnime = XfaniParser.detail(response.asJsoup()).anime.toAnime()
+    override fun animeDetailsParse(response: Response): SAnime = VideoParser.detail(response.asJsoup()).anime.toAnime().apply { initialized = true }
+
+    override fun seasonListParse(response: Response): List<SAnime> = throw UnsupportedOperationException()
 
     override fun episodeListParse(response: Response): List<SEpisode> {
-        val detail = XfaniParser.detail(response.asJsoup())
-        return XfaniParser.episodes(detail.sources, selectedSourceCode).map { episode ->
+        val detail = VideoParser.detail(response.asJsoup())
+        return VideoParser.episodes(detail.sources, selectedSourceCode).map { episode ->
             SEpisode.create().apply {
-                url = XfaniParser.episodePath(detail.anime.id, episode, detail.sources, selectedSourceCode)
-                name = XfaniParser.episodeName(episode)
+                url = VideoParser.episodePath(detail.anime.id, episode, detail.sources, selectedSourceCode)
+                name = VideoParser.episodeName(episode)
                 episode_number = episode.number
             }
         }.reversed()
     }
 
-    override fun videoListRequest(episode: SEpisode): Request {
-        require(Regex("^/anime/\\d+/play/\\d+(?:\\?.*)?$").matches(episode.url)) { "旧播放链接已失效，请刷新番剧的剧集列表后重试。" }
+    override fun hosterListRequest(episode: SEpisode): Request {
+        require(EPISODE_PATH.matches(episode.url)) { "旧播放链接已失效，请刷新番剧的剧集列表后重试。" }
         return GET(baseUrl + episode.url, headers)
     }
 
-    private fun resolvePlayback(episodeId: Int, sourceId: Int): PlaybackCandidate {
-        val body = buildJsonObject {
-            put("action", "fallback")
-            put("episode_id", episodeId)
-            put("source_id", sourceId)
-        }
-        client.newCall(apiRequest("functions/v1/issue-web-playback", body.toString())).execute().use { response ->
-            check(response.isSuccessful) { "播放解析失败：HTTP ${response.code}，请稍后重试或切换线路。" }
-            return XfaniParser.playback(response.body.string(), sourceId)
-        }
-    }
+    override fun hosterListParse(response: Response): List<Hoster> = VideoParser.hosters(VideoParser.playPage(response.asJsoup()), baseUrl)
 
-    override fun videoListParse(response: Response): List<Video> {
-        val play = XfaniParser.playPage(response.asJsoup())
-        val sources = play.sources.filter { source -> source.episodes.any { it.id == play.episodeId } }
-        check(sources.isNotEmpty()) { "暂无可用播放线路。" }
-        // Resolve only when selected by the user; one unavailable line must not hide the others.
-        return sources.sortedByDescending { it.code == play.pageSourceCode }.map { source ->
-            Video("$baseUrl/anime/${play.animeId}/play/${play.episodeId}?source=${source.code}", source.name, videoUrl = null, headers = headers)
-        }
-    }
-
-    override fun videoUrlParse(response: Response): String {
-        val play = XfaniParser.playPage(response.asJsoup())
-        val code = response.request.url.queryParameter("source") ?: play.pageSourceCode
-        val source = play.sources.firstOrNull { it.code == code && it.episodes.any { episode -> episode.id == play.episodeId } }
-            ?: error("当前线路没有这一集，请切换线路。")
-        return resolvePlayback(play.episodeId, source.id).url
+    override suspend fun getVideoList(hoster: Hoster): List<Video> {
+        val request = requireNotNull(hoster.internalData).parseAs<PlaybackRequest>()
+        val playback = client.newCall(apiRequest("functions/v1/issue-web-playback", request))
+            .awaitSuccess().parseAs<PlaybackInfo>()
+        val candidate = VideoParser.playback(playback, request.sourceId)
+        return listOf(
+            Video(
+                videoUrl = candidate.url,
+                videoTitle = candidate.quality ?: hoster.hosterName,
+                headers = headers,
+            ),
+        )
     }
 
     override fun getFilterList(): AnimeFilterList = AnimeFilterList(TypeFilter(), ClassFilter(), VersionFilter(), YearFilter(), SortFilter())
@@ -172,5 +143,7 @@ class Xfani :
         private const val PAGE_SIZE = 24
         private const val PREF_KEY_VIDEO_SOURCE = "PREF_KEY_VIDEO_SOURCE"
         private val SOURCE_CODES = listOf("xfxf1", "AL", "CS")
+        private val ANIME_PATH = Regex("^/anime/\\d+$")
+        private val EPISODE_PATH = Regex("^/anime/\\d+/play/\\d+(?:\\?.*)?$")
     }
 }
