@@ -4,12 +4,7 @@ import okhttp3.Headers
 import okhttp3.OkHttpClient
 import okhttp3.Request
 
-/**
- * Resolves Girigirilove media URLs with the same idea as the website player:
- * playback requests are independent from page requests, and some CDN hosts are
- * sensitive to the presence or absence of Referer.
- */
-class GirigiriloveVideoResolver(
+class VideoResolver(
     private val client: OkHttpClient,
     private val headerCandidates: List<Headers>,
     private val generatedPlaylistUrl: (segmentBaseUrl: String, segmentCount: Int) -> String,

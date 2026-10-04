@@ -6,11 +6,13 @@ import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
+import eu.kanade.tachiyomi.animesource.model.Hoster
 import eu.kanade.tachiyomi.animesource.model.SAnime
 import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.awaitSuccess
 import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.utils.getPreferencesLazy
 import kotlinx.serialization.json.Json
@@ -56,7 +58,7 @@ class Girigirilove :
     }
 
     private val videoResolver by lazy {
-        GirigiriloveVideoResolver(
+        VideoResolver(
             client = client.newBuilder()
                 .connectTimeout(3, TimeUnit.SECONDS)
                 .readTimeout(3, TimeUnit.SECONDS)
@@ -66,8 +68,6 @@ class Girigirilove :
             generatedPlaylistUrl = ::generatedPlaylistUrl,
         )
     }
-
-    // ===== Client =================================================================================
 
     override val client: OkHttpClient = network.client.newBuilder()
         .addInterceptor(::generatedM3u8Interceptor)
@@ -122,9 +122,7 @@ class Girigirilove :
             val body = response.peekBody(1024 * 1024).string()
             if (body.contains("什么都没有") || body.contains(".hl-total').html('0')") || body.contains(".hl-total').html(\"0\")")) {
                 response.close()
-                // Visit home page to get cookies
                 chain.proceed(GET("$baseUrl/", headers)).close()
-                // Retry original request
                 response = chain.proceed(request)
             }
         }
@@ -133,8 +131,6 @@ class Girigirilove :
 
     override fun headersBuilder() = super.headersBuilder()
         .add("Referer", "$baseUrl/")
-
-    // ===== Shared helpers =========================================================================
 
     private fun String?.toAbsoluteUrl(): String? {
         val url = this?.takeIf { it.isNotBlank() } ?: return null
@@ -192,19 +188,13 @@ class Girigirilove :
         return null
     }
 
-    // ===== Popular Anime ==========================================================================
-
     override fun popularAnimeRequest(page: Int): Request = GET("$baseUrl/show/2--hits------$page---/", headers)
 
     override fun popularAnimeParse(response: Response): AnimesPage = parseAnimePage(response)
 
-    // ===== Latest Anime ===========================================================================
-
     override fun latestUpdatesRequest(page: Int): Request = GET("$baseUrl/show/2--time------$page---/", headers)
 
     override fun latestUpdatesParse(response: Response): AnimesPage = parseAnimePage(response)
-
-    // ===== Search Anime ===========================================================================
 
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
         if (query.isNotBlank()) {
@@ -250,7 +240,6 @@ class Girigirilove :
     private fun parseAnimePage(response: Response): AnimesPage {
         val document = response.asJsoup()
 
-        // Code verification check
         if (document.select("button.verify-submit").isNotEmpty()) {
             throw Exception("请在 WebView 中输入验证码")
         }
@@ -274,8 +263,6 @@ class Girigirilove :
         return AnimesPage(animeList, hasNextPage)
     }
 
-    // ===== Anime Details ==========================================================================
-
     override fun animeDetailsParse(response: Response): SAnime {
         val document = response.asJsoup()
         return SAnime.create().apply {
@@ -292,8 +279,6 @@ class Girigirilove :
             }
         }
     }
-
-    // ===== Episode List ===========================================================================
 
     override fun episodeListParse(response: Response): List<SEpisode> {
         val document = response.asJsoup()
@@ -314,10 +299,19 @@ class Girigirilove :
         }.reversed()
     }
 
-    // ===== Video List =============================================================================
+    override suspend fun getHosterList(episode: SEpisode): List<Hoster> = listOf(
+        Hoster(
+            hosterName = name,
+            hosterUrl = getEpisodeUrl(episode),
+        ),
+    )
 
-    override fun videoListParse(response: Response): List<Video> {
-        val document = response.asJsoup()
+    override fun hosterListParse(response: Response): List<Hoster> = throw UnsupportedOperationException()
+
+    override fun getEpisodeUrl(episode: SEpisode): String = episode.url.toAbsoluteUrl()!!
+
+    override suspend fun getVideoList(hoster: Hoster): List<Video> {
+        val document = client.newCall(GET(hoster.hosterUrl, headers)).awaitSuccess().use { it.asJsoup() }
         val script = document.select("script:containsData(player_aaaa)").firstOrNull()?.data()
             ?: return emptyList()
 
@@ -332,14 +326,31 @@ class Girigirilove :
         }
         val videoUrl = decodedUrl.toAbsoluteUrl() ?: decodedUrl
 
-        val video = videoResolver.resolve(videoUrl)
-
-        return listOf(Video(video.url, "默认", video.url, headers = video.headers))
+        return listOf(
+            Video(
+                videoTitle = "默认",
+                preferred = true,
+                internalData = videoUrl,
+                initialized = false,
+            ),
+        )
     }
 
-    override fun videoUrlParse(response: Response): String = throw UnsupportedOperationException()
+    override suspend fun resolveVideo(video: Video): Video {
+        if (video.initialized) return video
 
-    // ===== Filters ================================================================================
+        val resolved = videoResolver.resolve(video.internalData)
+        return video.copy(
+            videoUrl = resolved.url,
+            headers = resolved.headers,
+            internalData = "",
+            initialized = true,
+        )
+    }
+
+    override fun videoListParse(response: Response, hoster: Hoster): List<Video> = throw UnsupportedOperationException()
+
+    override fun seasonListParse(response: Response): List<SAnime> = throw UnsupportedOperationException()
 
     override fun getFilterList() = AnimeFilterList(
         TypeFilter(),

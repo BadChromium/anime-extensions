@@ -1,6 +1,7 @@
 ext {
     extName = 'Girigirilove'
     extClass = '.Girigirilove'
+    libVersion = 16
     extVersionCode = 1
     isNsfw = false
 }
