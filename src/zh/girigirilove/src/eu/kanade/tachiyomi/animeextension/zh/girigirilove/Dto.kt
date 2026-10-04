@@ -16,3 +16,9 @@ class SuggestInfo(
     val name: String,
     val pic: String,
 )
+
+@Serializable
+class PlayerInfo(
+    val url: String? = null,
+    val encrypt: Int = 0,
+)

@@ -15,9 +15,7 @@ import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.awaitSuccess
 import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.utils.getPreferencesLazy
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
+import keiyoushi.utils.parseAs
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
@@ -26,7 +24,6 @@ import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
-import uy.kohesive.injekt.injectLazy
 import java.net.URLDecoder
 import java.util.concurrent.TimeUnit
 
@@ -41,7 +38,7 @@ class Girigirilove :
     override val lang = "zh"
 
     override val supportsLatest = true
-    private val json by injectLazy<Json>()
+
     private val preferences by getPreferencesLazy()
 
     private val selectedVideoLanguage
@@ -224,7 +221,7 @@ class Girigirilove :
 
     override fun searchAnimeParse(response: Response): AnimesPage {
         if (response.request.url.encodedPath.contains("suggest")) {
-            val suggestResponse = json.decodeFromString<SuggestResponse>(response.body.string())
+            val suggestResponse = response.parseAs<SuggestResponse>()
             val animeList = suggestResponse.list.map {
                 SAnime.create().apply {
                     url = "/GV${it.id}/"
@@ -315,11 +312,10 @@ class Girigirilove :
         val script = document.select("script:containsData(player_aaaa)").firstOrNull()?.data()
             ?: return emptyList()
 
-        val info = extractPlayerJson(script)?.let { json.parseToJsonElement(it) } ?: return emptyList()
-        val encodedUrl = info.jsonObject["url"]?.jsonPrimitive?.content ?: return emptyList()
-        val encrypt = info.jsonObject["encrypt"]?.jsonPrimitive?.content?.toIntOrNull() ?: 0
+        val info = extractPlayerJson(script)?.parseAs<PlayerInfo>() ?: return emptyList()
+        val encodedUrl = info.url ?: return emptyList()
 
-        val decodedUrl = when (encrypt) {
+        val decodedUrl = when (info.encrypt) {
             1 -> String(Base64.decode(encodedUrl, Base64.DEFAULT))
             2 -> URLDecoder.decode(String(Base64.decode(encodedUrl, Base64.DEFAULT), Charsets.UTF_8), "UTF-8")
             else -> encodedUrl
