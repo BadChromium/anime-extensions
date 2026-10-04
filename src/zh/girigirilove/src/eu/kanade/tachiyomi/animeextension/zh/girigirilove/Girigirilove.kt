@@ -12,10 +12,11 @@ import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.awaitSuccess
 import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.network.get
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
+import okhttp3.CacheControl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
@@ -129,15 +130,6 @@ class Girigirilove :
     override fun headersBuilder() = super.headersBuilder()
         .add("Referer", "$baseUrl/")
 
-    private fun String?.toAbsoluteUrl(): String? {
-        val url = this?.takeIf { it.isNotBlank() } ?: return null
-        return when {
-            url.startsWith("http://") || url.startsWith("https://") -> url
-            url.startsWith("//") -> "https:$url"
-            else -> baseUrl.toHttpUrl().resolve(url)?.toString() ?: url
-        }
-    }
-
     private fun generatedPlaylistUrl(segmentBaseUrl: String, segmentCount: Int): String = baseUrl.toHttpUrl().newBuilder()
         .addPathSegments(GENERATED_M3U8_PATH.removePrefix("/"))
         .addQueryParameter("base", segmentBaseUrl)
@@ -225,8 +217,8 @@ class Girigirilove :
             val animeList = suggestResponse.list.map {
                 SAnime.create().apply {
                     url = "/GV${it.id}/"
-                    thumbnail_url = it.pic.toAbsoluteUrl()
-                    title = it.name
+                    thumbnail_url = it.pic.takeIf { pic -> pic.isNotBlank() }?.let { pic -> baseUrl.toHttpUrl().resolve(pic)?.toString() }
+                    title = it.name.also { title -> require(title.isNotBlank()) { "Missing anime title" } }
                 }
             }
             return AnimesPage(animeList, suggestResponse.page < suggestResponse.pageCount)
@@ -243,10 +235,12 @@ class Girigirilove :
 
         val animeList = document.select(".public-list-box").mapNotNull {
             val a = it.selectFirst(".public-list-exp") ?: return@mapNotNull null
+            val animeTitle = a.attr("title").takeIf { title -> title.isNotBlank() } ?: return@mapNotNull null
+            val animeUrl = a.absUrl("href").takeIf { url -> url.isNotBlank() } ?: return@mapNotNull null
             SAnime.create().apply {
-                url = a.attr("href")
-                title = a.attr("title")
-                thumbnail_url = it.selectFirst("img")?.attr("data-src").toAbsoluteUrl()
+                setUrlWithoutDomain(animeUrl)
+                title = animeTitle
+                thumbnail_url = it.selectFirst("img")?.absUrl("data-src")?.takeIf { url -> url.isNotBlank() }
             }
         }
 
@@ -263,8 +257,8 @@ class Girigirilove :
     override fun animeDetailsParse(response: Response): SAnime {
         val document = response.asJsoup()
         return SAnime.create().apply {
-            title = document.selectFirst(".slide-info-title")?.text() ?: ""
-            thumbnail_url = document.selectFirst(".detail-pic img")?.attr("data-src").toAbsoluteUrl()
+            title = requireNotNull(document.selectFirst(".slide-info-title")?.text()?.takeIf { it.isNotBlank() }) { "Missing anime title" }
+            thumbnail_url = document.selectFirst(".detail-pic img")?.absUrl("data-src")?.takeIf { it.isNotBlank() }
             description = document.selectFirst("#height_limit.text")?.text()
             genre = document.select(".slide-info:contains(类型 :) a").joinToString { it.text() }
             author = document.select(".slide-info:contains(导演 :) a").joinToString { it.text() }
@@ -290,7 +284,7 @@ class Girigirilove :
         return selectedSource.select("li a").map {
             SEpisode.create().apply {
                 name = it.text()
-                url = it.attr("href")
+                setUrlWithoutDomain(it.absUrl("href"))
                 scanlator = sourceName
             }
         }.reversed()
@@ -305,10 +299,10 @@ class Girigirilove :
 
     override fun hosterListParse(response: Response): List<Hoster> = throw UnsupportedOperationException()
 
-    override fun getEpisodeUrl(episode: SEpisode): String = episode.url.toAbsoluteUrl()!!
+    override fun getEpisodeUrl(episode: SEpisode): String = requireNotNull(baseUrl.toHttpUrl().resolve(episode.url)) { "Invalid episode URL" }.toString()
 
     override suspend fun getVideoList(hoster: Hoster): List<Video> {
-        val document = client.newCall(GET(hoster.hosterUrl, headers)).awaitSuccess().use { it.asJsoup() }
+        val document = client.get(hoster.hosterUrl, cacheControl = CacheControl.Builder().build()).use { it.asJsoup() }
         val script = document.select("script:containsData(player_aaaa)").firstOrNull()?.data()
             ?: return emptyList()
 
@@ -320,7 +314,7 @@ class Girigirilove :
             2 -> URLDecoder.decode(String(Base64.decode(encodedUrl, Base64.DEFAULT), Charsets.UTF_8), "UTF-8")
             else -> encodedUrl
         }
-        val videoUrl = decodedUrl.toAbsoluteUrl() ?: decodedUrl
+        val videoUrl = baseUrl.toHttpUrl().resolve(decodedUrl)?.toString() ?: decodedUrl
 
         return listOf(
             Video(
