@@ -19,12 +19,9 @@ import keiyoushi.utils.parseAs
 import okhttp3.CacheControl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
-import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
-import okhttp3.ResponseBody.Companion.toResponseBody
 import java.net.URLDecoder
 import java.util.concurrent.TimeUnit
 
@@ -63,49 +60,12 @@ class Girigirilove :
                 .writeTimeout(3, TimeUnit.SECONDS)
                 .build(),
             headerCandidates = listOf(noRefererMediaHeaders, siteRefererMediaHeaders),
-            generatedPlaylistUrl = ::generatedPlaylistUrl,
+
         )
     }
 
     override val client: OkHttpClient = network.client.newBuilder()
-        .addInterceptor(::generatedM3u8Interceptor)
         .addInterceptor(::cookieRetryInterceptor)
-        .build()
-
-    private fun generatedM3u8Interceptor(chain: Interceptor.Chain): Response {
-        val request = chain.request()
-        if (request.url.encodedPath != GENERATED_M3U8_PATH) {
-            return chain.proceed(request)
-        }
-
-        val segmentBaseUrl = request.url.queryParameter("base")
-            ?: return generatedM3u8Response(request, 400, "Missing base parameter")
-        val segmentCount = request.url.queryParameter("count")?.toIntOrNull()
-            ?: return generatedM3u8Response(request, 400, "Missing count parameter")
-        if (segmentCount <= 0) {
-            return generatedM3u8Response(request, 400, "Invalid segment count")
-        }
-
-        return generatedM3u8Response(
-            request,
-            200,
-            buildGeneratedPlaylist(segmentBaseUrl, segmentCount),
-            HLS_MIME_TYPE,
-        )
-    }
-
-    private fun generatedM3u8Response(
-        request: Request,
-        code: Int,
-        body: String,
-        contentType: String = "text/plain",
-    ): Response = Response.Builder()
-        .request(request)
-        .protocol(Protocol.HTTP_1_1)
-        .code(code)
-        .message(if (code == 200) "OK" else "Bad Request")
-        .header("Content-Type", contentType)
-        .body(body.toResponseBody(contentType.toMediaType()))
         .build()
 
     private fun cookieRetryInterceptor(chain: Interceptor.Chain): Response {
@@ -116,7 +76,7 @@ class Girigirilove :
         }
 
         var response = chain.proceed(request)
-        if (url.contains("/show/") && response.isSuccessful) {
+        if (request.url.isSourceShowRequest(baseUrl.toHttpUrl()) && response.isSuccessful) {
             val body = response.peekBody(1024 * 1024).string()
             if (body.contains("什么都没有") || body.contains(".hl-total').html('0')") || body.contains(".hl-total').html(\"0\")")) {
                 response.close()
@@ -129,30 +89,6 @@ class Girigirilove :
 
     override fun headersBuilder() = super.headersBuilder()
         .add("Referer", "$baseUrl/")
-
-    private fun generatedPlaylistUrl(segmentBaseUrl: String, segmentCount: Int): String = baseUrl.toHttpUrl().newBuilder()
-        .addPathSegments(GENERATED_M3U8_PATH.removePrefix("/"))
-        .addQueryParameter("base", segmentBaseUrl)
-        .addQueryParameter("count", segmentCount.toString())
-        .build()
-        .toString()
-
-    private fun buildGeneratedPlaylist(segmentBaseUrl: String, segmentCount: Int) = buildString {
-        append("#EXTM3U\n")
-        append("#EXT-X-VERSION:3\n")
-        append("#EXT-X-TARGETDURATION:10\n")
-        append("#EXT-X-MEDIA-SEQUENCE:0\n")
-        append("#EXT-X-PLAYLIST-TYPE:VOD\n")
-
-        repeat(segmentCount) { index ->
-            append("#EXTINF:6.000000,\n")
-            append(segmentBaseUrl)
-            append(index.toString().padStart(4, '0'))
-            append(".ts\n")
-        }
-
-        append("#EXT-X-ENDLIST\n")
-    }
 
     private fun extractPlayerJson(script: String): String? {
         val jsonStart = script.indexOf('{', script.indexOf("player_aaaa=").takeIf { it >= 0 } ?: return null)
@@ -201,11 +137,9 @@ class Girigirilove :
         val year = filters.filterIsInstance<YearFilter>().firstOrNull()?.selected ?: ""
         val sort = filters.filterIsInstance<SortFilter>().firstOrNull()?.selected ?: "time"
 
-        // Pattern: /show/id-area-by-class-lang-letter-year-month-page-?-?-sort-
-        // Slots: 1:id, 3:sort/by, 4:class, 7:year, 9:page
         val url = baseUrl.toHttpUrl().newBuilder()
             .addPathSegment("show")
-            .addPathSegment("$type--$sort-$genre---$year--$page---")
+            .addPathSegment(showFilterPath(type, sort, genre, year, page))
             .addPathSegment("")
             .build()
         return GET(url.toString(), headers)
@@ -281,10 +215,11 @@ class Girigirilove :
         val selectedSource = playLists.getOrNull(selectedIndex) ?: playLists.firstOrNull() ?: return emptyList()
         val sourceName = sources.getOrNull(selectedIndex) ?: sources.firstOrNull() ?: "默认"
 
-        return selectedSource.select("li a").map {
+        return selectedSource.select("li a").mapNotNull {
+            val episodeUrl = it.episodeUrl(baseUrl.toHttpUrl()) ?: return@mapNotNull null
             SEpisode.create().apply {
                 name = it.text()
-                setUrlWithoutDomain(it.absUrl("href"))
+                setUrlWithoutDomain(episodeUrl)
                 scanlator = sourceName
             }
         }.reversed()
@@ -299,7 +234,10 @@ class Girigirilove :
 
     override fun hosterListParse(response: Response): List<Hoster> = throw UnsupportedOperationException()
 
-    override fun getEpisodeUrl(episode: SEpisode): String = requireNotNull(baseUrl.toHttpUrl().resolve(episode.url)) { "Invalid episode URL" }.toString()
+    override fun getEpisodeUrl(episode: SEpisode): String {
+        require(episode.url.isNotBlank()) { "Invalid episode URL" }
+        return requireNotNull(baseUrl.toHttpUrl().resolve(episode.url)?.takeIf { it.isEpisodeUrl(baseUrl.toHttpUrl()) }) { "Invalid episode URL" }.toString()
+    }
 
     override suspend fun getVideoList(hoster: Hoster): List<Video> {
         val document = client.get(hoster.hosterUrl, cacheControl = CacheControl.Builder().build()).use { it.asJsoup() }
@@ -369,8 +307,7 @@ class Girigirilove :
     companion object {
         private const val PREF_KEY_VIDEO_LANGUAGE = "PREF_KEY_VIDEO_LANGUAGE"
         private const val DEFAULT_VIDEO_LANGUAGE = "繁中"
-        private const val GENERATED_M3U8_PATH = "/__generated_m3u8__/playlist.m3u8"
-        private const val HLS_MIME_TYPE = "application/vnd.apple.mpegurl"
+
         private val VIDEO_LANGUAGE_OPTIONS = arrayOf("繁中", "简中")
     }
 }

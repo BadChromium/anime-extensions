@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.animeextension.zh.girigirilove
 
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
+import java.util.Calendar
 
 open class SelectFilter(
     name: String,
@@ -78,34 +79,7 @@ class GenreFilter :
 class YearFilter :
     SelectFilter(
         "年份",
-        arrayOf(
-            "全部" to "",
-            "2024" to "2024",
-            "2023" to "2023",
-            "2022" to "2022",
-            "2021" to "2021",
-            "2020" to "2020",
-            "2019" to "2019",
-            "2018" to "2018",
-            "2017" to "2017",
-            "2016" to "2016",
-            "2015" to "2015",
-            "2014" to "2014",
-            "2013" to "2013",
-            "2012" to "2012",
-            "2011" to "2011",
-            "2010" to "2010",
-            "2009" to "2009",
-            "2008" to "2008",
-            "2007" to "2007",
-            "2006" to "2006",
-            "2005" to "2005",
-            "2004" to "2004",
-            "2003" to "2003",
-            "2002" to "2002",
-            "2001" to "2001",
-            "2000" to "2000",
-        ),
+        (listOf("全部" to "") + (Calendar.getInstance().get(Calendar.YEAR) downTo 2000).map { it.toString() to it.toString() }).toTypedArray(),
     )
 
 class SortFilter :

@@ -1,85 +1,47 @@
 package eu.kanade.tachiyomi.animeextension.zh.girigirilove
 
+import keiyoushi.network.get
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import okhttp3.CacheControl
 import okhttp3.Headers
 import okhttp3.OkHttpClient
-import okhttp3.Request
+import java.io.IOException
 
 class VideoResolver(
     private val client: OkHttpClient,
     private val headerCandidates: List<Headers>,
-    private val generatedPlaylistUrl: (segmentBaseUrl: String, segmentCount: Int) -> String,
+
 ) {
 
-    fun resolve(videoUrl: String): ResolvedVideo {
-        if (!videoUrl.isHlsPlaylist()) {
-            return ResolvedVideo(videoUrl, firstWorkingHeaders(videoUrl))
-        }
-
-        headerCandidates.firstOrNull { urlExists(videoUrl, it) }?.let { headers ->
-            return ResolvedVideo(videoUrl, headers)
-        }
-
-        headerCandidates.forEach { headers ->
-            val segmentBaseUrl = videoUrl.substringBeforeLast('/', "") + "/"
-            if (urlExists(tsSegmentUrl(segmentBaseUrl, 0), headers)) {
-                val segmentCount = findTsSegmentCount(segmentBaseUrl, headers)
-                return ResolvedVideo(
-                    generatedPlaylistUrl(segmentBaseUrl, segmentCount),
-                    headers,
-                )
+    suspend fun resolve(videoUrl: String): ResolvedVideo {
+        var failure: IOException? = null
+        for (headers in headerCandidates) {
+            try {
+                if (urlExists(videoUrl, headers)) return ResolvedVideo(videoUrl, headers)
+            } catch (error: IOException) {
+                failure = error
             }
         }
-
-        return ResolvedVideo(videoUrl, headerCandidates.first())
+        failure?.let { throw it }
+        throw IOException("Media URL is unavailable")
     }
 
-    private fun firstWorkingHeaders(videoUrl: String): Headers = headerCandidates.firstOrNull { urlExists(videoUrl, it) } ?: headerCandidates.first()
-
-    private fun findTsSegmentCount(segmentBaseUrl: String, headers: Headers): Int {
-        var lastExisting = 0
-        var firstMissing = 1
-        while (firstMissing <= MAX_SEGMENT_PROBE && urlExists(tsSegmentUrl(segmentBaseUrl, firstMissing), headers)) {
-            lastExisting = firstMissing
-            firstMissing *= 2
-        }
-
-        if (lastExisting >= MAX_SEGMENT_PROBE) {
-            return lastExisting + 1
-        }
-
-        while (lastExisting + 1 < firstMissing) {
-            val middle = (lastExisting + firstMissing) / 2
-            if (urlExists(tsSegmentUrl(segmentBaseUrl, middle), headers)) {
-                lastExisting = middle
-            } else {
-                firstMissing = middle
+    private suspend fun urlExists(url: String, headers: Headers): Boolean {
+        currentCoroutineContext().ensureActive()
+        val probeHeaders = headers.newBuilder().set("Range", "bytes=0-0").build()
+        return client.get(url, probeHeaders, cacheControl = CacheControl.Builder().build(), ensureSuccess = false).use {
+            currentCoroutineContext().ensureActive()
+            when {
+                it.isSuccessful -> true
+                it.code == 404 || it.code == 410 -> false
+                else -> throw IOException("Cannot determine media availability: HTTP ${it.code}")
             }
         }
-
-        return lastExisting + 1
-    }
-
-    private fun String.isHlsPlaylist(): Boolean = substringBefore('?').endsWith(".m3u8")
-
-    private fun tsSegmentUrl(segmentBaseUrl: String, index: Int): String = segmentBaseUrl + index.toString().padStart(4, '0') + ".ts"
-
-    private fun urlExists(url: String, headers: Headers): Boolean = try {
-        val request = Request.Builder()
-            .url(url)
-            .headers(headers)
-            .header("Range", "bytes=0-0")
-            .build()
-        client.newCall(request).execute().use { it.isSuccessful }
-    } catch (_: Exception) {
-        false
     }
 
     data class ResolvedVideo(
         val url: String,
         val headers: Headers,
     )
-
-    private companion object {
-        const val MAX_SEGMENT_PROBE = 2048
-    }
 }
